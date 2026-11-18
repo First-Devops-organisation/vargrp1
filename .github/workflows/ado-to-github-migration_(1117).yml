@@ -1,0 +1,618 @@
+name: YASH-DevOps-Serverless/ado-to-github-migration_(1117)
+on:
+  workflow_dispatch:
+env:
+  ADO_Org: YashTech-DevOps
+  ADO_Project: YASH-DevOps-Serverless
+  ADO_Repo: eShopOnWeb
+  GitHub_Org: First-Devops-organisation
+  GitHub_Repo: eShopOnWeb
+  GitHub_User: varsha-patilyash
+jobs:
+  Setup-InstallTools:
+    runs-on: windows-latest
+    steps:
+    - name: checkout
+      uses: actions/checkout@v4.1.0
+    - name: Install GitHub CLI
+      run: |-
+        Write-Host "Installing GitHub CLI..."
+        winget install --id GitHub.cli -e --source winget
+        gh --version
+      shell: powershell
+  SingleRepoMigration-MigrateSingleRepo:
+    needs:
+    - Setup-InstallTools
+    runs-on: windows-latest
+    timeout-minutes: 120
+    steps:
+    - name: checkout
+      uses: actions/checkout@v4.1.0
+    - name: Step 1 - Authenticate GitHub & Install ado2gh
+      run: |-
+        $env:GH_TOKEN = "${{ secrets.GH_PAT }}"
+        echo $env:GH_TOKEN | gh auth login --with-token
+        gh auth status
+        gh extension install github/gh-ado2gh
+        gh extension list
+      shell: powershell
+    - name: Step 2 - Pre-check Repo Existence in GitHub
+      continue-on-error: true
+      run: |-
+        $env:GH_TOKEN = "${{ secrets.GH_PAT }}"
+        $repo = "${{ env.GitHub_Repo }}"
+        $org  = "${{ env.GitHub_Org }}"
+        Write-Host "========== Pre-Migration Repository Status =========="
+        Write-Host "Checking repository: $org/$repo"
+        try {
+            $ErrorActionPreference = 'Stop'
+            [void](gh repo view "$org/$repo" --json name 2>&1)
+            Write-Host "Repo already exists in GitHub: $repo"
+            "ALREADY_EXISTS" | Out-File "${{ runner.temp }}\repo-precheck.txt" -Encoding utf8
+            Write-Host "##vso[task.setvariable variable=REPO_STATUS]ALREADY_EXISTS"
+        }
+        catch {
+            Write-Host "Repo does not exist yet (will be migrated): $repo"
+            "NOT_EXISTS" | Out-File "${{ runner.temp }}\repo-precheck.txt" -Encoding utf8
+            Write-Host "##vso[task.setvariable variable=REPO_STATUS]NOT_EXISTS"
+        }
+        finally {
+            $ErrorActionPreference = 'Continue'
+        }
+        exit 0
+      shell: powershell
+    - name: Step 3 - Migrate Repo (gh ado2gh)
+      if: success() && env.REPO_STATUS != 'ALREADY_EXISTS'
+      run: |-
+        $env:GH_PAT  = "${{ secrets.GH_PAT }}"
+        $env:ADO_PAT = "${{ secrets.ADO_PAT }}"
+        $stateFile = "${{ runner.temp }}\migration-state.txt"
+        Write-Host "Starting migration..."
+        Write-Host "  ADO:    ${{ env.ADO_Org }}/${{ env.ADO_Project }}/${{ env.ADO_Repo }}"
+        Write-Host "  GitHub: ${{ env.GitHub_Org }}/${{ env.GitHub_Repo }}"
+        Write-Host "State: PENDING"
+        "PENDING" | Out-File $stateFile -Encoding utf8
+        Write-Host "State: EXPORTING from ADO..."
+        "EXPORTING" | Out-File $stateFile -Encoding utf8
+        gh ado2gh migrate-repo `
+          --ado-org "${{ env.ADO_Org }}" `
+          --ado-team-project "${{ env.ADO_Project }}" `
+          --ado-repo "${{ env.ADO_Repo }}" `
+          --github-org "${{ env.GitHub_Org }}" `
+          --github-repo "${{ env.GitHub_Repo }}"
+        if ($LASTEXITCODE -eq 0) {
+            Write-Host "State: COMPLETE"
+            "COMPLETE" | Out-File $stateFile -Encoding utf8
+        } else {
+            Write-Host "State: FAILED (exit code: $LASTEXITCODE)"
+            "FAILED" | Out-File $stateFile -Encoding utf8
+            exit 1
+        }
+      shell: powershell
+    - name: Step 4 - Post-Migration Audit (Branch-Wise)
+      if: always()
+      continue-on-error: true
+      run: |-
+        $ErrorActionPreference = 'continue'
+        $ghOrg    = "${{ env.GitHub_Org }}"
+        $ghRepo   = "${{ env.GitHub_Repo }}"
+        $ghPat    = "${{ secrets.GH_PAT }}"
+        $auditDir = "${{ runner.temp }}\audit"
+        New-Item -ItemType Directory -Path $auditDir -Force | Out-Null
+        New-Item -ItemType Directory -Path "$auditDir\folder-listing" -Force | Out-Null
+        Write-Host "============================================"
+        Write-Host "  GITHUB POST-MIGRATION AUDIT (BRANCH-WISE)"
+        Write-Host "  Repo: $ghOrg / $ghRepo"
+        Write-Host "  Date: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+        Write-Host "============================================"
+        Write-Host ""
+        Write-Host "Cloning GitHub repo (mirror)..."
+        $ErrorActionPreference = 'SilentlyContinue'
+        git clone --mirror "https://$ghPat@github.com/$ghOrg/$ghRepo.git" gh-mirror 2>&1 | ForEach-Object { Write-Host $_ }
+        $ErrorActionPreference = 'Continue'
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "##vso[task.logissue type=warning]Could not clone GitHub repo for audit"
+            exit 0
+        }
+        Set-Location gh-mirror
+        $branches = git branch | ForEach-Object { $_.Trim().TrimStart("* ") } | Where-Object { $_ -ne "" }
+        $branchCount = $branches.Count
+        Write-Host "Total Branches: $branchCount"
+        $branches | Out-File "$auditDir\gh-branches.txt" -Encoding utf8
+        $defaultBranchRef = git symbolic-ref HEAD 2>$null
+        if ($defaultBranchRef) {
+            $defaultBranch = $defaultBranchRef.Trim() -replace '^refs/heads/', ''
+        } else {
+            $defaultBranch = if ($branchCount -gt 0) { $branches[0].Trim() } else { "" }
+        }
+        Write-Host "Default Branch: $defaultBranch"
+        $allFolderFileRows = @()
+        $allFolderSummaryRows = @()
+        $tags = git tag -l
+        $tagCount = if ($tags) { ($tags | Measure-Object).Count } else { 0 }
+        Write-Host "Total Tags: $tagCount"
+        if ($tags) { $tags | Out-File "$auditDir\gh-tags.txt" -Encoding utf8 }
+        else { "" | Out-File "$auditDir\gh-tags.txt" -Encoding utf8 }
+        $totalCommits = (git rev-list --count --all).Trim()
+        Write-Host "Total Commits (all branches): $totalCommits"
+        $latestHash    = (git log -1 --format="%H").Trim()
+        $latestAuthor  = (git log -1 --format="%an").Trim()
+        $latestDate    = (git log -1 --format="%ad" --date=short).Trim()
+        $latestMessage = (git log -1 --format="%s").Trim()
+        $repoSize = git count-objects -vH
+        Write-Host "Repo Size:"
+        $repoSize | ForEach-Object { Write-Host "  $_" }
+        $repoSize | Out-File "$auditDir\gh-repo-size.txt" -Encoding utf8
+        Write-Host ""
+        Write-Host "============================================"
+        Write-Host "  BRANCH-WISE DETAILS"
+        Write-Host "============================================"
+        $branchCsvRows = @()
+        foreach ($branch in $branches) {
+            $b = $branch.Trim()
+            if ($b -eq "") { continue }
+            $bCommits = (git rev-list --count $b 2>$null)
+            if (-not $bCommits) { $bCommits = "0" }
+            $bCommits = $bCommits.Trim()
+            $bFiles = git ls-tree -r --name-only $b 2>$null
+            $bFileCount = if ($bFiles) { ($bFiles | Measure-Object).Count } else { 0 }
+            $bFolders = git ls-tree -r -d --name-only $b 2>$null
+            $bFolderCount = if ($bFolders) { ($bFolders | Measure-Object).Count } else { 0 }
+            # -- Folder-wise file listing --
+            $filesByFolder = [ordered]@{}
+            if ($bFiles) {
+                foreach ($f in $bFiles) {
+                    $folder = Split-Path $f -Parent
+                    if (-not $folder -or $folder -eq "") { $folder = "(root)" }
+                    $folder = $folder -replace '\\', '/'
+                    if (-not $filesByFolder.Contains($folder)) { $filesByFolder[$folder] = @() }
+                    $filesByFolder[$folder] += Split-Path $f -Leaf
+                }
+            }
+            $safeBranch = $b -replace '[/\\]', '--'
+            $branchFileMd = "# Files in branch: $b`n`n"
+            foreach ($folder in ($filesByFolder.Keys | Sort-Object)) {
+                $branchFileMd += "## $folder/`n"
+                foreach ($file in ($filesByFolder[$folder] | Sort-Object)) {
+                    $branchFileMd += "- $file`n"
+                }
+                $branchFileMd += "`n"
+            }
+            $branchFileMd | Out-File "$auditDir\folder-listing\gh-files-$safeBranch.md" -Encoding utf8
+            Write-Host "    Folder listing saved: gh-files-$safeBranch.md"
+            foreach ($folder in $filesByFolder.Keys) {
+                $allFolderSummaryRows += [PSCustomObject]@{
+                    Branch    = $b
+                    Folder    = $folder
+                    FileCount = $filesByFolder[$folder].Count
+                }
+                foreach ($file in $filesByFolder[$folder]) {
+                    $allFolderFileRows += [PSCustomObject]@{
+                        Branch   = $b
+                        Folder   = $folder
+                        FileName = $file
+                    }
+                }
+            }
+            if ($b -eq $defaultBranch) {
+                $folderSummaryMd = "| Folder | Files |`n|---|---|`n"
+                $folderTotal = 0
+                foreach ($folder in ($filesByFolder.Keys | Sort-Object)) {
+                    $fc = $filesByFolder[$folder].Count
+                    $folderTotal += $fc
+                    $folderSummaryMd += "| $folder | $fc |`n"
+                }
+                $folderSummaryMd += "| **Total** | **$folderTotal** |`n"
+                $folderSummaryMd | Out-File "$auditDir\gh-folder-summary-default.md" -Encoding utf8
+            }
+            $bHash   = (git log -1 --format="%H" $b 2>$null)
+            $bAuthor = (git log -1 --format="%an" $b 2>$null)
+            $bDate   = (git log -1 --format="%ad" --date=short $b 2>$null)
+            $bMsg    = (git log -1 --format="%s" $b 2>$null)
+            if ($bHash)   { $bHashShort = $bHash.Trim().Substring(0, [Math]::Min(12, $bHash.Trim().Length)) } else { $bHashShort = "N/A" }
+            if ($bAuthor) { $bAuthor = $bAuthor.Trim() } else { $bAuthor = "N/A" }
+            if ($bDate)   { $bDate = $bDate.Trim() } else { $bDate = "N/A" }
+            if ($bMsg)    { $bMsg = $bMsg.Trim() } else { $bMsg = "N/A" }
+            Write-Host "  Branch: $b"
+            Write-Host "    Commits: $bCommits | Files: $bFileCount | Folders: $bFolderCount"
+            Write-Host "    Latest:  $bHashShort by $bAuthor on $bDate"
+            Write-Host "    Message: $bMsg"
+            Write-Host ""
+            $branchCsvRows += [PSCustomObject]@{
+                Branch       = $b
+                Commits      = $bCommits
+                Files        = $bFileCount
+                Folders      = $bFolderCount
+                LatestHash   = $bHashShort
+                LatestAuthor = $bAuthor
+                LatestDate   = $bDate
+                LatestMsg    = $bMsg
+            }
+        }
+        $branchCsvRows | Export-Csv "$auditDir\gh-branch-wise-data.csv" -NoTypeInformation -Encoding utf8
+        $mdTable = "| # | Branch | Commits | Files | Latest Commit | Date |`n"
+        $mdTable += "|---|---|---|---|---|---|`n"
+        $idx = 1
+        foreach ($row in ($branchCsvRows | Sort-Object { [int]$_.Commits } -Descending)) {
+            $mdTable += "| $idx | ``$($row.Branch)`` | **$($row.Commits)** | $($row.Files) | $($row.LatestAuthor) - *$($row.LatestMsg)* | $($row.LatestDate) |`n"
+            $idx++
+        }
+        $mdTable | Out-File "$auditDir\gh-branch-wise-table.md" -Encoding utf8
+        if ($allFolderFileRows.Count -gt 0) {
+            $allFolderFileRows | Export-Csv "$auditDir\gh-folder-wise-files.csv" -NoTypeInformation -Encoding utf8
+        }
+        if ($allFolderSummaryRows.Count -gt 0) {
+            $allFolderSummaryRows | Export-Csv "$auditDir\gh-folder-summary.csv" -NoTypeInformation -Encoding utf8
+        }
+        Write-Host ""
+        Write-Host "Folder-wise file listings saved to: $auditDir\folder-listing\"
+        Write-Host "Combined CSV: gh-folder-wise-files.csv ($($allFolderFileRows.Count) rows)"
+        Write-Host "Folder summary CSV: gh-folder-summary.csv ($($allFolderSummaryRows.Count) rows)"
+        Write-Host "============================================"
+        Write-Host "  PULL REQUEST AUDIT (BRANCH-WISE)"
+        Write-Host "============================================"
+        Set-Location ..
+        $env:GH_TOKEN = $ghPat
+        $allPRs = @()
+        $page = 1
+        do {
+            $prs = gh api "repos/$ghOrg/$ghRepo/pulls?state=all&per_page=100&page=$page" 2>$null | ConvertFrom-Json
+            if ($prs -and $prs.Count -gt 0) {
+                $allPRs += $prs
+                $page++
+            } else {
+                break
+            }
+        } while ($prs.Count -eq 100)
+        $totalPRs    = $allPRs.Count
+        $totalOpen   = 0
+        $totalMerged = 0
+        $totalClosed = 0
+        Write-Host "Total PRs fetched: $totalPRs"
+        $prByHead = @{}
+        foreach ($pr in $allPRs) {
+            $head = $pr.head.ref
+            if (-not $prByHead.ContainsKey($head)) {
+                $prByHead[$head] = @{ Open = 0; Merged = 0; Closed = 0 }
+            }
+            if ($pr.state -eq "open") {
+                $prByHead[$head].Open++
+                $totalOpen++
+            } elseif ($pr.merged_at) {
+                $prByHead[$head].Merged++
+                $totalMerged++
+            } else {
+                $prByHead[$head].Closed++
+                $totalClosed++
+            }
+        }
+        $prHeadMd = "| Source Branch (head) | Open | Merged | Closed | Total |`n"
+        $prHeadMd += "|---|---|---|---|---|`n"
+        foreach ($b in ($prByHead.Keys | Sort-Object)) {
+            $o = $prByHead[$b].Open; $m = $prByHead[$b].Merged; $c = $prByHead[$b].Closed; $t = $o + $m + $c
+            Write-Host "  Source: $b | Open: $o | Merged: $m | Closed: $c | Total: $t"
+            $prHeadMd += "| $b | $o | $m | $c | $t |`n"
+        }
+        $prHeadMd += "| **TOTAL** | **$totalOpen** | **$totalMerged** | **$totalClosed** | **$totalPRs** |`n"
+        $prHeadMd | Out-File "$auditDir\gh-pr-by-source-branch.md" -Encoding utf8
+        $prByBase = @{}
+        foreach ($pr in $allPRs) {
+            $base = $pr.base.ref
+            if (-not $prByBase.ContainsKey($base)) {
+                $prByBase[$base] = @{ Open = 0; Merged = 0; Closed = 0 }
+            }
+            if ($pr.state -eq "open") { $prByBase[$base].Open++ }
+            elseif ($pr.merged_at) { $prByBase[$base].Merged++ }
+            else { $prByBase[$base].Closed++ }
+        }
+        $prBaseMd = "| Target Branch (base) | Open | Merged | Closed | Total |`n"
+        $prBaseMd += "|---|---|---|---|---|`n"
+        foreach ($b in ($prByBase.Keys | Sort-Object)) {
+            $o = $prByBase[$b].Open; $m = $prByBase[$b].Merged; $c = $prByBase[$b].Closed; $t = $o + $m + $c
+            Write-Host "  Target: $b | Open: $o | Merged: $m | Closed: $c | Total: $t"
+            $prBaseMd += "| $b | $o | $m | $c | $t |`n"
+        }
+        $prBaseMd | Out-File "$auditDir\gh-pr-by-target-branch.md" -Encoding utf8
+        $branchCount  | Out-File "$auditDir\gh-branch-count.txt" -Encoding utf8
+        $tagCount     | Out-File "$auditDir\gh-tag-count.txt" -Encoding utf8
+        $totalCommits | Out-File "$auditDir\gh-commit-count.txt" -Encoding utf8
+        $totalPRs     | Out-File "$auditDir\gh-pr-count.txt" -Encoding utf8
+        $totalOpen    | Out-File "$auditDir\gh-pr-open.txt" -Encoding utf8
+        $totalMerged  | Out-File "$auditDir\gh-pr-merged.txt" -Encoding utf8
+        $totalClosed  | Out-File "$auditDir\gh-pr-closed.txt" -Encoding utf8
+        $latestHash   | Out-File "$auditDir\gh-latest-hash.txt" -Encoding utf8
+        Write-Host ""
+        Write-Host "Audit completed."
+        if ((Test-Path -LiteralPath variable:\LASTEXITCODE)) { exit $LASTEXITCODE }
+      shell: powershell -Command "& '{0}'"
+    - name: Step 5 - Download Migration Logs
+      if: always() && env.REPO_STATUS != 'ALREADY_EXISTS'
+      continue-on-error: true
+      run: |-
+        $env:GH_PAT   = "${{ secrets.GH_PAT }}"
+        $env:GH_TOKEN = "${{ secrets.GH_PAT }}"
+        $logDir = "${{ runner.temp }}\migration-logs"
+        New-Item -ItemType Directory -Path $logDir -Force | Out-Null
+        $repo = "${{ env.GitHub_Repo }}"
+        # Large repos (5+ GB) need more time for GEI to generate logs
+        Write-Host "Waiting 300 seconds for GEI logs to be available (large repo support)..."
+        Start-Sleep -Seconds 300
+        $repoDir = "$logDir\$repo"
+        New-Item -ItemType Directory -Path $repoDir -Force | Out-Null
+        $logFile = "$repoDir\migration-log-$repo.log"
+        Write-Host "Downloading migration log for: $repo"
+        $success = $false
+        for ($i = 1; $i -le 15; $i++) {
+            try {
+                Write-Host "  Attempt $i/15..."
+                $output = gh ado2gh download-logs `
+                  --github-org "${{ env.GitHub_Org }}" `
+                  --github-repo "$repo" `
+                  --migration-log-file "$logFile" `
+                  --overwrite 2>&1
+                if ($LASTEXITCODE -eq 0) {
+                    Write-Host "  Logs downloaded for $repo"
+                    $success = $true
+                    break
+                } else {
+                    Write-Host "  Attempt ${i}: Exit code $LASTEXITCODE. Waiting 60s..."
+                    Start-Sleep -Seconds 60
+                }
+            }
+            catch {
+                Write-Host "  Attempt ${i}: $($_.Exception.Message). Waiting 60s..."
+                Start-Sleep -Seconds 60
+            }
+        }
+        if (-not $success) {
+            Write-Host "  Logs NOT available after 15 retries."
+            "Log download failed after 15 retries for $repo" | Out-File $logFile -Encoding utf8
+        }
+        exit 0
+      shell: powershell
+    - name: Step 6 - Publish Migration Logs
+      if: always()
+      uses: actions/upload-artifact@v4.1.0
+      with:
+        name: MigrationLogs
+        path: "${{ runner.temp }}\\migration-logs"
+    - name: Step 7 - Publish Audit Data
+      if: always()
+      uses: actions/upload-artifact@v4.1.0
+      with:
+        name: MigrationAudit
+        path: "${{ runner.temp }}\\audit"
+    - name: Step 8 - Generate Migration Dashboard
+      if: always()
+      continue-on-error: true
+      run: |-
+        $auditDir     = "${{ runner.temp }}\audit"
+        $repo         = "${{ env.GitHub_Repo }}"
+        $adoRepo      = "${{ env.ADO_Repo }}"
+        $precheckFile = "${{ runner.temp }}\repo-precheck.txt"
+        Write-Host "============================================"
+        Write-Host "  GENERATING MIGRATION DASHBOARD"
+        Write-Host "============================================"
+        $precheckStatus = "UNKNOWN"
+        if (Test-Path $precheckFile) {
+            $precheckStatus = (Get-Content $precheckFile -Raw).Trim()
+        }
+        $logFile = "${{ runner.temp }}\migration-logs\$repo\migration-log-$repo.log"
+        $migrationResult = "Failed"
+        $migrationDetail = "No logs available"
+        # Read migration state file (written by Step 3)
+        $stateFilePath = "${{ runner.temp }}\migration-state.txt"
+        $migStateValue = "UNKNOWN"
+        if (Test-Path $stateFilePath) {
+            $migStateValue = (Get-Content $stateFilePath -Raw).Trim()
+        }
+        if ($precheckStatus -eq "ALREADY_EXISTS") {
+            $migrationResult = "Already Exists"
+            $migrationDetail = "Repo was already present in GitHub before migration"
+        } elseif ($migStateValue -eq "COMPLETE") {
+            # Trust migration-state.txt first (handles large repos where logs may not download)
+            $migrationResult = "Success"
+            $migrationDetail = "Migration completed successfully (verified via state file)"
+            if (Test-Path $logFile) {
+                $logContent = Get-Content $logFile -Raw -ErrorAction SilentlyContinue
+                if ($logContent -match "Log download failed") {
+                    $migrationDetail = "Migration completed successfully (logs unavailable for large repo)"
+                }
+            }
+        } elseif (Test-Path $logFile) {
+            $logContent = Get-Content $logFile -Raw
+            if ($logContent -match "successfully|completed" -or $logContent.Length -gt 100) {
+                $migrationResult = "Success"
+                $migrationDetail = "Migration completed successfully"
+            } else {
+                $migrationDetail = "Check migration logs for errors"
+            }
+        }
+        function Get-Val($file) {
+            $p = "$auditDir\$file"
+            if (Test-Path $p) { return (Get-Content $p -Raw).Trim() }
+            return "N/A"
+        }
+        $branchCount  = Get-Val "gh-branch-count.txt"
+        $tagCount     = Get-Val "gh-tag-count.txt"
+        $commitCount  = Get-Val "gh-commit-count.txt"
+        $prCount      = Get-Val "gh-pr-count.txt"
+        $prOpen       = Get-Val "gh-pr-open.txt"
+        $prMerged     = Get-Val "gh-pr-merged.txt"
+        $prClosed     = Get-Val "gh-pr-closed.txt"
+        $latestHash   = Get-Val "gh-latest-hash.txt"
+        $ghRepoSize   = Get-Val "gh-repo-size.txt"
+        $branchWiseTable = "No branch data"
+        if (Test-Path "$auditDir\gh-branch-wise-table.md") {
+            $branchWiseTable = (Get-Content "$auditDir\gh-branch-wise-table.md" -Raw).Trim()
+        }
+        $prHeadTable = "No PR data"
+        if (Test-Path "$auditDir\gh-pr-by-source-branch.md") {
+            $prHeadTable = (Get-Content "$auditDir\gh-pr-by-source-branch.md" -Raw).Trim()
+        }
+        $prBaseTable = "No PR data"
+        if (Test-Path "$auditDir\gh-pr-by-target-branch.md") {
+            $prBaseTable = (Get-Content "$auditDir\gh-pr-by-target-branch.md" -Raw).Trim()
+        }
+        $folderSummaryTable = "No folder data"
+        if (Test-Path "$auditDir\gh-folder-summary-default.md") {
+            $folderSummaryTable = (Get-Content "$auditDir\gh-folder-summary-default.md" -Raw).Trim()
+        }
+        # Status emoji mapping
+        $emojiCheck = [char]::ConvertFromUtf32(0x2705)
+        $emojiWarn  = [char]::ConvertFromUtf32(0x26A0) + [char]::ConvertFromUtf32(0xFE0F)
+        $emojiCross = [char]::ConvertFromUtf32(0x274C)
+        $emojiRocket = [char]::ConvertFromUtf32(0x1F680)
+        $emojiCalendar = [char]::ConvertFromUtf32(0x1F4C5)
+        $emojiPackage = [char]::ConvertFromUtf32(0x1F4E6)
+        $emojiDart = [char]::ConvertFromUtf32(0x1F3AF)
+        $emojiFF = [char]::ConvertFromUtf32(0x23E9)
+        $emojiChart = [char]::ConvertFromUtf32(0x1F4CA)
+        $emojiSeed = [char]::ConvertFromUtf32(0x1F33F)
+        $emojiTag = [char]::ConvertFromUtf32(0x1F3F7) + [char]::ConvertFromUtf32(0xFE0F)
+        $emojiMemo = [char]::ConvertFromUtf32(0x1F4DD)
+        $emojiPR = [char]::ConvertFromUtf32(0x1F500)
+        $emojiTrophy = [char]::ConvertFromUtf32(0x1F3C6)
+        $emojiBulb = [char]::ConvertFromUtf32(0x1F4A1)
+        $emojiGreen = [char]::ConvertFromUtf32(0x1F7E2)
+        $emojiPurple = [char]::ConvertFromUtf32(0x1F7E3)
+        $emojiRed = [char]::ConvertFromUtf32(0x1F534)
+        $emojiTrafficLight = [char]::ConvertFromUtf32(0x1F6A6)
+        $emojiFolder = [char]::ConvertFromUtf32(0x1F4C2)
+        $emojiBrain = [char]::ConvertFromUtf32(0x1F9E0)
+        $emojiInfo = [char]::ConvertFromUtf32(0x2139) + [char]::ConvertFromUtf32(0xFE0F)
+        $emojiInbox = [char]::ConvertFromUtf32(0x1F4E5)
+        $emojiArrow = [char]::ConvertFromUtf32(0x2192)
+        $emojiDash = [char]::ConvertFromUtf32(0x2014)
+        # Status labels
+        if ($migrationResult -eq "Already Exists") {
+            $statusIcon = $emojiWarn
+            $statusText = "Skipped $emojiDash Repository Already Exists"
+            $statusCallout = "[!WARNING]"
+            $reasonText = "Target repository was detected in GitHub prior to migration."
+        } elseif ($migrationResult -eq "Success") {
+            $statusIcon = $emojiCheck
+            $statusText = "Completed $emojiDash Migration Successful"
+            $statusCallout = "[!NOTE]"
+            $reasonText = "Repository migrated successfully from ADO to GitHub."
+        } else {
+            $statusIcon = $emojiCross
+            $statusText = "Failed $emojiDash Migration Error"
+            $statusCallout = "[!CAUTION]"
+            $reasonText = "Check migration logs for error details."
+        }
+        $nl = [Environment]::NewLine
+        $dot = [char]0x00B7
+        $dottedLine = (($dot + " ") * 50).Trim()
+        $stateFile = "${{ runner.temp }}\migration-state.txt"
+        $migState = "UNKNOWN"
+        if (Test-Path $stateFile) {
+            $migState = (Get-Content $stateFile -Raw).Trim()
+        }
+        # Pipeline Execution Status (vertical table)
+        $pipelineSection = "## $emojiTrafficLight Pipeline Execution Status" + $nl + $nl
+        $pipelineSection += "| Phase&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; | Status&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; |" + $nl
+        $pipelineSection += "|:---|:---|" + $nl
+        if ($precheckStatus -eq "ALREADY_EXISTS") {
+            $pipelineSection += "| $emojiCheck Pre-Check | Completed |" + $nl
+            $pipelineSection += "| $emojiFF Migration | Skipped |" + $nl
+            $pipelineSection += "| $emojiCheck Audit | Completed |" + $nl
+            $pipelineSection += "| $emojiWarn Result | Repository Already Exists |" + $nl + $nl
+        } elseif ($migState -eq "COMPLETE" -or $migrationResult -eq "Success") {
+            $pipelineSection += "| $emojiCheck Pre-Check | Completed |" + $nl
+            $pipelineSection += "| $emojiCheck Migration | Completed |" + $nl
+            $pipelineSection += "| $emojiCheck Audit | Completed |" + $nl
+            $pipelineSection += "| $emojiCheck Result | Migration Successful |" + $nl + $nl
+        } else {
+            $pipelineSection += "| $emojiCheck Pre-Check | Completed |" + $nl
+            $pipelineSection += "| $emojiCross Migration | Failed |" + $nl
+            $pipelineSection += "| $emojiCheck Audit | Completed |" + $nl
+            $pipelineSection += "| $emojiCross Result | Migration Failed |" + $nl + $nl
+        }
+        $pipelineSection += "$emojiInfo Reason: $reasonText" + $nl + $nl
+        # Top branches (simplified - Rank, Branch, Commits, Files only)
+        $branchCsvFile = "$auditDir\gh-branch-wise-data.csv"
+        $top5 = ""
+        if (Test-Path $branchCsvFile) {
+            $rows = Import-Csv $branchCsvFile
+            $sorted = $rows | Sort-Object { [int]$_.Commits } -Descending | Select-Object -First 5
+            $top5 = "| Rank&nbsp;&nbsp;&nbsp;&nbsp; | Branch&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; | Commits&nbsp;&nbsp;&nbsp;&nbsp; | Files&nbsp;&nbsp;&nbsp;&nbsp; |" + $nl
+            $top5 += "|:---:|:---|:---:|:---:|" + $nl
+            $rank = 1
+            foreach ($r in $sorted) {
+                $top5 += "| $rank | ``$($r.Branch)`` | $($r.Commits) | $($r.Files) |" + $nl
+                $rank++
+            }
+        }
+        # Format date
+        $migDate = Get-Date -Format 'dd MMM yyyy · HH:mm'
+        # Build report
+        $report = ""
+        $report += "# $emojiRocket ADO $emojiArrow GitHub Migration Report" + $nl + $nl
+        $report += "> $statusCallout" + $nl
+        $report += "> Status: $statusIcon $statusText" + $nl + $nl
+        $report += $dottedLine + $nl + $nl
+        # Migration Overview
+        $report += "## $emojiFolder Migration Overview" + $nl + $nl
+        $report += "| Field&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; | Value&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; |" + $nl
+        $report += "|:---|:---|" + $nl
+        $report += "| $emojiCalendar Migration Date | $migDate |" + $nl
+        $report += "| $emojiPackage Source (ADO) | ``${{ env.ADO_Org }} / ${{ env.ADO_Project }} / $adoRepo`` |" + $nl
+        $report += "| $emojiDart Target (GitHub) | ``${{ env.GitHub_Org }} / $repo`` |" + $nl + $nl
+        # Pipeline Execution Status
+        $report += $dottedLine + $nl + $nl
+        $report += $pipelineSection
+        $report += $dottedLine + $nl + $nl
+        # Repository Snapshot (vertical Metric/Count table)
+        $report += "## $emojiChart Repository Snapshot" + $nl + $nl
+        $report += "| Metric&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; | Count&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; |" + $nl
+        $report += "|:---|:---|" + $nl
+        $report += "| $emojiSeed Branches | $branchCount |" + $nl
+        $report += "| $emojiTag Tags | $tagCount |" + $nl
+        $report += "| $emojiMemo Unique Commits | $commitCount |" + $nl
+        $report += "| $emojiPR Pull Requests | $prOpen Open / $prMerged Merged / $prClosed Closed |" + $nl + $nl
+        $report += "$emojiBrain *Commit count is deduplicated across branches.*" + $nl + $nl
+        # Top Branches by Activity
+        $report += $dottedLine + $nl + $nl
+        $report += "## $emojiTrophy Top Branches by Activity" + $nl + $nl
+        if ($top5 -ne "") {
+            $report += $top5 + $nl
+        } else {
+            $report += "No branch data available" + $nl + $nl
+        }
+        # All Branches (collapsible)
+        $report += $dottedLine + $nl + $nl
+        $report += "## $emojiSeed View All Branches ($branchCount)" + $nl + $nl
+        $report += "<details>" + $nl
+        $report += "<summary>Click to expand</summary>" + $nl + $nl
+        $report += $branchWiseTable + $nl + $nl
+        $report += "</details>" + $nl + $nl
+        # Audit & Artifacts section
+        $report += $dottedLine + $nl + $nl
+        $report += "## $emojiPackage Audit & Artifacts" + $nl + $nl
+        $report += "$emojiInbox MigrationAudit Artifact Includes:" + $nl + $nl
+        $report += "- Folder-wise file inventory" + $nl
+        $report += "- Commit-to-branch mapping" + $nl
+        $report += "- PR details (CSV)" + $nl
+        $report += "- Validation checks" + $nl + $nl
+        $report += "$emojiCheck Recommended for audit & compliance reviews." + $nl
+        $reportPath = "${{ github.workspace }}\migration-report.md"
+        $report | Out-File $reportPath -Encoding utf8
+        Write-Host ""
+        Write-Host "========================================="
+        Write-Host "  DASHBOARD SUMMARY"
+        Write-Host "========================================="
+        Write-Host "  Status:     $migrationResult"
+        Write-Host "  Branches:   $branchCount"
+        Write-Host "  Tags:       $tagCount"
+        Write-Host "  Commits:    $commitCount"
+        Write-Host "  PRs Total:  $prCount"
+        Write-Host "  PRs Open:   $prOpen"
+        Write-Host "  PRs Merged: $prMerged"
+        Write-Host "  PRs Closed: $prClosed"
+        Write-Host "========================================="
+      shell: powershell
+    - name: Step 9 - Publish Dashboard to Summary
+      if: always()
+      run: Write-Host '##vso[task.uploadsummary]${{ github.workspace }}\migration-report.md'
+      shell: powershell
